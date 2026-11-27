@@ -178,6 +178,26 @@ class SQLiteStore:
         with self.connect() as db:
             db.execute('INSERT INTO events VALUES (?,?,?)',(uuid.uuid4().hex,state['id'],json.dumps({'type':'repair_early','asset_id':state['event']['asset_id'],'expected_end':state['event']['expected_end']})))
             db.execute('INSERT OR REPLACE INTO domain_assets VALUES (?,?)',(state['event']['asset_id'],state['event']['expected_end']))
+    def crew_roster(self):
+        vehicles={v['id']:v for v in self.network_data()[0]}
+        original={v['id']:v for v in self.network[0]}
+        result=[]
+        for member in self.network[2]:
+            v=vehicles.get(member['vehicle_id']); seed_vehicle=original.get(member['vehicle_id'])
+            # The synthetic duty start is derived from the original schedule,
+            # not shifted when execution delays or cancels the service.
+            dep=datetime.fromisoformat(seed_vehicle['departure'].replace('Z','+00:00')) if seed_vehicle else None
+            end=dep+timedelta(hours=member.get('remaining_hours',12)) if dep else None
+            assignments=[{'vehicle_id':v['id'],'departure':v['departure'],'arrival':v.get('arrival')}] if v and v.get('status')!='canceled' else []
+            result.append({'id':member['name'],'name':member['name'],'role':'Unknown (synthetic)',
+                           'duty_start':(end-timedelta(hours=12)).isoformat() if end else None,'duty_limit_hours':12,'assignments':assignments})
+        return result
+    def audit_data(self,id):
+        with self.connect() as db:
+            plans=[{'plan_version':r['plan_version'],'superseded':bool(r['superseded']),**json.loads(r['data'])} for r in db.execute('SELECT plan_version,superseded,data FROM recovery_plan_versions WHERE incident_id=? ORDER BY plan_version,option_id',(id,))]
+            decisions=[{**json.loads(r['data']),'at':r['at']} for r in db.execute('SELECT data,at FROM decisions WHERE incident_id=? ORDER BY id',(id,))]
+            executions=[{'plan_version':r['plan_version'],**json.loads(r['data'])} for r in db.execute('SELECT plan_version,data FROM execution_versions WHERE incident_id=? ORDER BY plan_version',(id,))]
+        return {'plans':plans,'decisions':decisions,'executions':executions}
     def outcomes(self,event_type):
         with self.connect() as db: return [dict(r) for r in db.execute('SELECT * FROM incident_outcomes WHERE event_type=? ORDER BY at',(event_type,))]
     def save_watch(self,watch):
@@ -245,7 +265,7 @@ class SupabaseStore:
         bookings=[]
         for b in bs:
             p=people[b['passenger_id']]
-            bookings.append({'id':p['id'],'name':p['name'],'tier':b['tier'],'language':p['language'],'booking_id':b['id'],'vehicle_id':b['vehicle_id'],'pnr':b['pnr'],'fare':float(b['fare']),'special':p.get('special'),'family':p.get('family',False),'elderly':p.get('elderly',False),'connection':bool(b['connecting_vehicle_id']),'connecting_vehicle_id':b['connecting_vehicle_id']})
+            bookings.append({'id':p['id'],'name':p['name'],'tier':b['tier'],'language':p['language'],'booking_id':b['id'],'vehicle_id':b['vehicle_id'],'pnr':b['pnr'],'fare':float(b['fare']),'status':b.get('status','confirmed'),'rebooked_to':b.get('rebooked_to_vehicle_id'),'special':p.get('special'),'family':p.get('family',False),'elderly':p.get('elderly',False),'connection':bool(b['connecting_vehicle_id']),'connecting_vehicle_id':b['connecting_vehicle_id']})
         crew=[]
         for a in assignments:
             c=crew_by_id[a['crew_id']]; v=lookup[a['vehicle_id']]
@@ -315,6 +335,28 @@ class SupabaseStore:
         return self.client.rpc('syncria_rebook',{'p_incident':incident_id,'p_passenger':passenger_id,'p_booking':booking_id,'p_vehicle':vehicle_id}).execute().data
     def early_event(self,state):
         self.client.rpc('syncria_replan_event',{'p_incident':state['id'],'p_expected_end':state['event']['expected_end']}).execute()
+    def crew_roster(self):
+        crew=self.rows('crew'); vs={v['id']:v for v in self.network_data()[0]}; assignments=[]; offset=0
+        while True:
+            page=self.client.table('crew_assignments').select('*').order('crew_id').order('vehicle_id').range(offset,offset+499).execute().data
+            assignments.extend(page)
+            if len(page)<500: break
+            offset+=500
+        by_crew={}
+        for assignment in assignments:
+            v=vs.get(assignment['vehicle_id'])
+            if v and v.get('status')!='canceled': by_crew.setdefault(assignment['crew_id'],[]).append({'vehicle_id':v['id'],'departure':v['departure'],'arrival':v.get('arrival')})
+        return [{'id':c['id'],'name':c['name'],'role':c['role'],'duty_start':c['duty_start'],'duty_limit_hours':float(c['duty_limit_hours']),'assignments':by_crew.get(c['id'],[])} for c in crew]
+    def audit_data(self,id):
+        def rows(table,order):
+            result=[]; offset=0
+            while True:
+                part=self.client.table(table).select('*').eq('incident_id',id).order(order).range(offset,offset+499).execute().data
+                result.extend(part)
+                if len(part)<500: return result
+                offset+=500
+        executions=[{'plan_version':r['plan_version'],**r['result']} for r in rows('execution_results','plan_version')]
+        return {'plans':rows('recovery_plans','id'),'decisions':rows('decisions','id'),'executions':executions}
     def outcomes(self,event_type):
         result=[]; offset=0
         while True:

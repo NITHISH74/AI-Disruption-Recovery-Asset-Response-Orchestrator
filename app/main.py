@@ -1,4 +1,4 @@
-import asyncio, json, os, secrets, threading, uuid
+import asyncio, copy, json, os, secrets, threading, uuid
 from datetime import timedelta
 from dotenv import load_dotenv
 load_dotenv()
@@ -18,6 +18,8 @@ from .intelligence import apply_learning, cluster_passengers
 from .passenger_assistant import answer as passenger_answer
 from .graph import build_graph
 from .notifications import make_notifications, greeting_templates
+from .finance import savings_estimate, regulatory_exposure
+from .controller_tools import crew_monitor, handover_template
 from langgraph.types import Command
 from collections import Counter
 from contextlib import asynccontextmanager
@@ -68,6 +70,9 @@ def planning_step(state, feedback=''):
     impact={**state['impact'],'_bookings':state.get('affected_bookings',[])}
     if not feedback and state.get('decision'): feedback=state['decision'].get('feedback','')
     state['options']=generate_options(impact,state['event'],state.get('original_vehicles',vehicles),feedback)
+    for option in state['options']:
+        option['regulatory_exposure']=regulatory_exposure(state.get('affected_bookings',[]),state.get('original_vehicles',vehicles),state['event'],{**option,'_affected_vehicles':state['impact']['affected_vehicles']})
+    log(state,'planner','compensation','Illustrative EU-style exposure (not legal advice): '+', '.join(f"{o['option_id']} €{o['regulatory_exposure']['total_eur']:,}" for o in state['options']))
     groups=cluster_passengers(state.get('affected_bookings',[]),state.get('original_vehicles',vehicles),state['impact']['affected_vehicles'])
     state['options'][1]['groups']=groups
     largest=max(groups,key=lambda g:g['size']) if groups else None
@@ -109,6 +114,9 @@ def execute_step(state):
     state['executed']=result
     state['work_orders']=[result['work_order']] if result.get('work_order') else []
     state['status']='executing'
+    state['savings']={**savings_estimate(state['impact']['pax_count'],state['event']['duration_h'],option['cost_usd']),'at':now(),'plan_version':state.get('plan_version',1),'option_id':option['option_id']}
+    estimate=state['savings']
+    log(state,'executor','savings',f"Estimated savings: manual baseline ${estimate['baseline_usd']:,} vs plan ${estimate['plan_cost_usd']:,} → ${estimate['savings_usd']:,} (not actual)")
     n=sum(bool(c['to_vehicle']) for c in result['changes']); rail=sum(c['mode']=='train' for c in result['changes'])
     tiers={b['booking_id']:b.get('tier','regular') for b in state.get('affected_bookings',[])}
     seated=Counter(tiers.get(c['booking_id'],'regular') for c in result['changes'] if c.get('to_vehicle'))
@@ -254,7 +262,7 @@ def logout(response: Response, authorization: str = Header(default='')):
 @app.middleware('http')
 async def protect_dashboard(request: Request, call_next):
     path=request.url.path
-    protected=(path in ('/api/schedule','/api/replan','/api/watches') or path.startswith('/api/work_orders') or path.startswith('/api/incidents'))
+    protected=(path in ('/api/schedule','/api/replan','/api/watches','/api/roi','/api/crew','/api/handover') or path.startswith('/api/work_orders') or path.startswith('/api/incidents'))
     # Passenger feed is a demo endpoint; authentication/PNR ownership is future work.
     if path.endswith('/passengers'): protected=False
     if protected and os.getenv('REQUIRE_CONTROLLER_LOGIN','1')=='1':
@@ -311,14 +319,52 @@ def simulate_watch():
     watch={'id':'simulation-BLR','hub':'BLR','reason':'thunderstorm','wind_kmh':45,'expected_at':at.isoformat(),'hours':8,'source':'simulation','message':'Early Warning: simulated thunderstorm at BLR in ~8h (winds 45 km/h) — pre-position crews recommended'}
     record_watch(watch); return watch
 
+@app.get('/api/roi')
+def roi():
+    month=datetime.now(timezone.utc).strftime('%Y-%m')
+    # One latest executed estimate per incident; re-plans are not added together.
+    estimates=[s['savings'] for s in store.all_states() if s.get('savings') and s['savings'].get('at','').startswith(month)]
+    return {'month':month,'total_savings_usd':sum(e['savings_usd'] for e in estimates),'incident_count':len(estimates),'basis':'estimated, latest executed plan per incident; not actual realized savings'}
+
+def log_controller_tool(agent,step,message):
+    store.log(None,{'agent':agent,'step':step,'message':message,'at':now()})
+
+@app.get('/api/crew')
+def crew_legality():
+    roster=crew_monitor(store.crew_roster())
+    log_controller_tool('crew','legality',f"Crew duty snapshot: {len(roster)} members, {sum(bool(c.get('alert')) for c in roster)} alerts")
+    return {'crew':roster,'basis':'simplified duty-end projection, not legal or regulatory advice'}
+
+@app.post('/api/handover')
+def handover():
+    states=store.all_states(); crew=crew_monitor(store.crew_roster())
+    orders=[w for w in store.list_orders() if str(w.get('status','')).lower() not in ('done','completed','closed')]
+    decisions=[]
+    for incident in states[:10]:
+        for decision in store.audit_data(incident['id'])['decisions']:
+            decisions.append({**decision,'incident_id':incident['id']})
+    decisions.sort(key=lambda d:d.get('at') or '',reverse=True)
+    template=handover_template(states,orders,crew,decisions[:10])
+    # Input contains incident IDs and counts only; no passenger records or secrets.
+    text=get_llm('Rewrite this synthetic transport shift handover clearly and concisely. Do not invent or omit any facts.',template,template,agent='conductor')
+    log_controller_tool('conductor','handover',f"Shift handover generated: {len(states)} incidents reviewed, {len(orders)} open work orders")
+    return {'text':text,'basis':'Demo snapshot; verify before operational use'}
+
 @app.get('/api/schedule')
-def schedule(): return {'vehicles': vehicles, 'passengers': len(passengers), 'crew': crew}
+def schedule():
+    current_vehicles,current_bookings,current_crew=store.network_data()
+    return {'vehicles':current_vehicles,'passengers':len(current_bookings),'crew':current_crew}
 @app.get('/api/incidents/latest')
 def latest():
-    states=store.all_states()
-    if states and states[0].get('status') in ('active','awaiting_approval','executing','replanning'):
-        return load(states[0]['id'])
-    return None
+    active=[s for s in store.all_states() if s.get('status') in ('active','awaiting_approval','executing','replanning')]
+    if not active: return None
+    newest=max(active,key=lambda s:s.get('created_at',''))
+    return load(newest['id'])
+@app.get('/api/incidents')
+def list_incidents():
+    states=sorted(store.all_states(),key=lambda s:s.get('created_at',''),reverse=True)
+    return [{'id':s['id'],'status':s['status'],'created_at':s['created_at'],'event_type':s.get('event',{}).get('type','unknown')} for s in states]
+
 @app.get('/api/incidents/{id}')
 def get_incident(id: str): return load(id)
 @app.post('/api/incidents', status_code=202)
@@ -457,11 +503,63 @@ def replan(id: str, authorization: str = Header(default='')):
             state=load(id); state['status']='replanning'; save(state)
             raise HTTPException(500,'Re-planning failed; no new plan was executed')
         return load(id)
+def timeline_entries(logs):
+    entries=[]
+    for index,entry in enumerate(logs):
+        duration=None
+        if index+1<len(logs):
+            try:
+                start=datetime.fromisoformat(entry['at'].replace('Z','+00:00'))
+                end=datetime.fromisoformat(logs[index+1]['at'].replace('Z','+00:00'))
+                duration=max(0,round((end-start).total_seconds(),3))
+            except (KeyError,ValueError,TypeError): pass
+        entries.append({**entry,'seconds_to_next':duration})
+    return entries
+
+@app.get('/api/incidents/{id}/audit')
+def incident_audit(id: str):
+    state=load(id)
+    log(state,'conductor','audit','Controller opened incident audit report')
+    save(state)
+    data=store.audit_data(id)
+    # Notifications are read from their own table; they may lag execution.
+    return {'incident_id':id,'created_at':state['created_at'],'status':state['status'],
+            'event':state['event'],'impact':state.get('impact'),'current_options':state.get('options',[]),
+            'savings':state.get('savings'),'timeline':timeline_entries(load(id).get('logs',[])),
+            'notifications':store.get_notifications(id),**data}
+
 @app.get('/api/incidents/{id}/passengers')
 def passenger_view(id: str, passenger_id: str = ''):
     load(id)
     notes=store.get_notifications(id) if os.getenv('ENABLE_LEGACY_FLOW')!='1' else load(id)['notifications']
     return {'notifications':[n for n in notes if not passenger_id or n['passenger_id']==passenger_id]}
+class WhatIfRequest(BaseModel):
+    action: str
+    vehicle_id: str = ''
+    delay_hours: float = 2
+
+@app.post('/api/incidents/{id}/what-if')
+def what_if(id: str, data: WhatIfRequest):
+    # Deliberate logging exception: even agent_log/LLM usage writes would violate
+    # the controller's zero-write dry-run guarantee.
+    if data.action not in ('cancel','delay'): raise HTTPException(400,'Choose cancel or delay')
+    if not 0 < data.delay_hours <= 48: raise HTTPException(400,'Delay must be greater than zero and at most 48 hours')
+    state=load(id); vs,bs,cs=copy.deepcopy(store.network_data()); event=copy.deepcopy(state['event'])
+    if data.action=='delay':
+        event['duration_h']=data.delay_hours
+        start=datetime.fromisoformat(event['window_start'].replace('Z','+00:00'))
+        event['expected_end']=(start+timedelta(hours=data.delay_hours)).isoformat()
+    impact=compute_cascade(vs,bs,cs,event)
+    if data.action=='cancel' and data.vehicle_id not in impact['affected_vehicles']: raise HTTPException(400,'Choose an affected service')
+    options=generate_options(impact,event,vs,data.vehicle_id if data.action=='cancel' else '')
+    try: apply_learning(options,store.outcomes(event['type']))
+    except Exception: pass
+    for option in options:
+        option['regulatory_exposure']=regulatory_exposure(impact['_bookings'],vs,event,{**option,'_affected_vehicles':impact['affected_vehicles']})
+    return {'dry_run':True,'action':data.action,'selected_option':'B' if data.action=='cancel' else 'A',
+            'impact':{k:v for k,v in impact.items() if k!='_bookings'},'options':options,
+            'disclaimer':'Projection only: no database writes, execution, notifications, or reservations.'}
+
 class PassengerQuestion(BaseModel):
     passenger_id: str
     booking_id: str

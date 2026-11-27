@@ -47,11 +47,13 @@ def compute_cascade(vehicles, passengers, crew, event):
             ids = [v['id'] for v in vehicles if v['id'] in ids and start <= datetime.fromisoformat(v['departure'].replace('Z','+00:00')) <= end]
     elif kind == 'engine': ids = ['AK-201']
     else: ids = ['AK-207']
-    if event.get('replanning'):
-        # A re-plan must not silently resurrect already canceled services.
-        active={v['id'] for v in vehicles if v.get('status') != 'canceled'}
-        ids=[id for id in ids if id in active]
-    elif event.get('recovered_early'): ids = ids[:max(1, len(ids)//2)]
+    # Previously canceled services/bookings are no longer part of the active
+    # transport network, whether this is a re-plan or a later incident.
+    active={v['id'] for v in vehicles if v.get('status') != 'canceled'}
+    ids=[id for id in ids if id in active]
+    if not event.get('replanning') and event.get('recovered_early'):
+        ids=ids[:max(1,len(ids)//2)]
+    passengers=[p for p in passengers if p.get('status') != 'canceled']
     affected = [p for p in passengers if p['vehicle_id'] in ids]
     by_id = {v['id']:v for v in vehicles}
     missed = 0

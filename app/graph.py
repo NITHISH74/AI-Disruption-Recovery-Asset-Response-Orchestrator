@@ -26,6 +26,7 @@ class OpsState(TypedDict, total=False):
     reject_count: int
     plan_version: int
     previous_pax: int
+    savings: dict
     restore: bool
 
 _connection=None
