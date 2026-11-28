@@ -19,6 +19,7 @@ from .passenger_assistant import answer as passenger_answer
 from .graph import build_graph
 from .notifications import make_notifications, greeting_templates
 from .finance import savings_estimate, regulatory_exposure
+from .agents import detector_agent, impact_agent, planner_agent, TOOL_REGISTRY
 from .controller_tools import crew_monitor, handover_template
 from langgraph.types import Command
 from collections import Counter
@@ -58,7 +59,16 @@ def impact_step(state):
     event=state['event']
     log(state, 'impact', 'start', 'Mapping the disruption across the network')
     current_vehicles,current_bookings,current_crew=store.network_data()
-    impact=compute_cascade(current_vehicles, current_bookings, current_crew, event)
+    impact=TOOL_REGISTRY['compute_cascade'](current_vehicles, TOOL_REGISTRY['get_bookings'](current_bookings), TOOL_REGISTRY['get_crew'](current_crew), event)
+    ground={'affected_vehicles':impact['affected_vehicles'],'pax_at_risk':impact['pax_count'],
+            'missed_connections':TOOL_REGISTRY['get_connections'](impact),
+            'crew_risks':[r['vehicle'] for r in impact['crew_risks']],
+            'priority_pax':[p['booking_id'] for p in impact['priority_pax']]}
+    proposal=impact_agent().run({'ground_truth':ground,'detector_assessment':state.get('agent_detector')},state['id'])
+    state['agent_impact']={'source':'validated_llm' if proposal else 'deterministic_fallback','interpretation':proposal.cascade_narrative if proposal else 'deterministic_cascade'}
+    if proposal:
+        log(state,'impact','agent_validated','LLM impact interpretation validated against deterministic tool results: '+proposal.cascade_narrative)
+    else: log(state,'impact','agent_fallback','Impact agent unavailable or invalid; using deterministic cascade.')
     state['impact']={k:v for k,v in impact.items() if k!='_bookings'}
     state['affected_bookings']=impact['_bookings']
     state['original_vehicles']=current_vehicles
@@ -69,7 +79,7 @@ def planning_step(state, feedback=''):
     log(state, 'planner', 'start', 'Evaluating recovery strategies and operational constraints')
     impact={**state['impact'],'_bookings':state.get('affected_bookings',[])}
     if not feedback and state.get('decision'): feedback=state['decision'].get('feedback','')
-    state['options']=generate_options(impact,state['event'],state.get('original_vehicles',vehicles),feedback)
+    state['options']=TOOL_REGISTRY['generate_options'](impact,state['event'],state.get('original_vehicles',vehicles),feedback)
     for option in state['options']:
         option['regulatory_exposure']=regulatory_exposure(state.get('affected_bookings',[]),state.get('original_vehicles',vehicles),state['event'],{**option,'_affected_vehicles':state['impact']['affected_vehicles']})
     log(state,'planner','compensation','Illustrative EU-style exposure (not legal advice): '+', '.join(f"{o['option_id']} €{o['regulatory_exposure']['total_eur']:,}" for o in state['options']))
@@ -84,6 +94,22 @@ def planning_step(state, feedback=''):
         for message in messages: log(state,'planner','learning','Learning: '+message)
     except Exception:
         log(state,'planner','learning','Historical learning unavailable; base confidence retained')
+    evidence=[{'option_id':o['option_id'],'cost_usd':o['cost_usd'],'pax_affected':o['pax_affected'],
+               'confidence':o['confidence'],'crew_safe':TOOL_REGISTRY['check_crew_legality'](o),
+               'rules_compliant':TOOL_REGISTRY['check_seats'](o)} for o in TOOL_REGISTRY['cost_options'](state['options'])]
+    proposal=planner_agent().run({'options':evidence,'impact':{'pax_count':state['impact']['pax_count'],
+                                  'missed_connections':state['impact']['missed_connections']},'analyst_assessment':state.get('agent_impact')},state['id'])
+    safe=[o for o in state['options'] if o['crew_safe'] and o['rules_compliant']]
+    fallback=max(safe or state['options'],key=lambda o:o['confidence'])
+    state['agent_recommendation']={'option_id':proposal.recommended_option if proposal else fallback['option_id'],
+                                  'source':'validated_llm' if proposal else 'deterministic_fallback',
+                                  'reason':proposal.reasoning if proposal else 'highest_confidence',
+                                  'trade_offs':proposal.trade_offs if proposal else [],
+                                  'risks':proposal.risks if proposal else [],
+                                  'confidence_adjustment_proposed':proposal.confidence_adjustment if proposal else 0}
+    # The LLM adjustment is advisory only; deterministic confidence is unchanged.
+    log(state,'planner','agent_validated' if proposal else 'agent_fallback',
+        f"Planner recommendation {state['agent_recommendation']['option_id']} ({state['agent_recommendation']['source']}; reason: {state['agent_recommendation']['reason']}); controller approval required.")
     state['plan_version']=state.get('plan_version',0)+1
     state['status']='awaiting_approval'
     store.persist_analysis(state)
@@ -94,8 +120,6 @@ def planning_step(state, feedback=''):
         state['previous_pax']=None
     log(state,'conductor','pause','Paused at the human approval gate. No actions executed.')
     save(state)
-    if any(os.getenv(k) for k in ('GEMINI_API_KEY','GROQ_API_KEY','OPENAI_API_KEY','ANTHROPIC_API_KEY')):
-        threading.Thread(target=enrich_text,args=(state['id'],),daemon=True).start()
     if state['event']['type']=='storm' and os.getenv('ENABLE_WEATHER','1')=='1':
         threading.Thread(target=weather_context,args=(state['id'],),daemon=True).start()
 
@@ -105,7 +129,17 @@ def plan(state, feedback=''):
 
 def detect_step(state):
     # Detector runs at incident ingestion so the alert appears immediately.
-    state['disruption']={'severity':state['event']['severity'],'expected_end':state['event']['expected_end'],'asset_id':state['event']['asset_id']}
+    event=state['event']; current_vehicles,_,_=store.network_data()
+    evidence={'event_type':event['type'],'severity':event['severity'],'asset':event['asset_id'],
+              **TOOL_REGISTRY['get_asset_status'](event,current_vehicles),
+              'services_in_window':TOOL_REGISTRY['get_schedule_window'](event,current_vehicles),
+              'duration_h':event['duration_h']}
+    proposal=detector_agent().run(evidence,state['id'])
+    state['agent_detector']={'source':'validated_llm' if proposal else 'deterministic_fallback',
+                             'assessment':proposal.reasoning if proposal else 'reported_disruption'}
+    log(state,'detector','agent_validated' if proposal else 'agent_fallback',
+        'Detector assessment: '+state['agent_detector']['assessment']+' ('+state['agent_detector']['source']+').')
+    state['disruption']={'severity':event['severity'],'expected_end':event['expected_end'],'asset_id':event['asset_id']}
 
 def execute_step(state):
     option=next(o for o in state['options'] if o['option_id']==state['decision']['option_id'])
@@ -133,8 +167,6 @@ def notify_step(state):
     state['notifications']=store.get_notifications(state['id']); counts=Counter(n['language'] for n in notes)
     log(state,'communicator','complete',f"{len(notes)} notifications ready ("+' · '.join(f"{k} {counts[k]}" for k in ('en','hi','ta','es'))+')')
     state['status']='done'; save(state)
-    if any(os.getenv(k) for k in ('GEMINI_API_KEY','GROQ_API_KEY','OPENAI_API_KEY','ANTHROPIC_API_KEY')):
-        threading.Thread(target=enrich_notifications,args=(state['id'],sorted(counts),{b['language'] for b in state.get('affected_bookings',[]) if b.get('tier') in ('gold','medic')}),daemon=True).start()
 
 def enrich_notifications(id,languages,priority_languages=()):
     try:
@@ -346,7 +378,8 @@ def handover():
     decisions.sort(key=lambda d:d.get('at') or '',reverse=True)
     template=handover_template(states,orders,crew,decisions[:10])
     # Input contains incident IDs and counts only; no passenger records or secrets.
-    text=get_llm('Rewrite this synthetic transport shift handover clearly and concisely. Do not invent or omit any facts.',template,template,agent='conductor')
+    # Free-form generation cannot be deterministically fact-validated; use the template.
+    text=template
     log_controller_tool('conductor','handover',f"Shift handover generated: {len(states)} incidents reviewed, {len(orders)} open work orders")
     return {'text':text,'basis':'Demo snapshot; verify before operational use'}
 
@@ -576,9 +609,7 @@ def voice_assistant(id: str, data: PassengerQuestion):
         if not booking: raise HTTPException(404,'Booking not found')
         vehicle=next((v for v in vs if v['id']==booking['vehicle_id']),{})
         lang=note.get('language','en'); intent,reply=passenger_answer(data.text,lang,booking,vehicle,state['event'])
-    if intent=='unknown':
-        # Do not send the stored booking or passenger identity to the provider.
-        reply=get_llm('Answer a general transport passenger question briefly in language '+lang+'. Do not invent facts or bookings.',data.text,reply,incident_id=id,agent='passenger_assistant')
+    # Unstructured general answers are not verifiable; keep the safe template.
     with lock:
         state=load(id)
         log(state,'communicator','passenger_assistant',f'Passenger assistant answered {intent} intent ({lang})')

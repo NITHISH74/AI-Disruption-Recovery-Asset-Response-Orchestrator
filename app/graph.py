@@ -27,6 +27,9 @@ class OpsState(TypedDict, total=False):
     plan_version: int
     previous_pax: int
     savings: dict
+    agent_detector: dict
+    agent_impact: dict
+    agent_recommendation: dict
     restore: bool
 
 _connection=None

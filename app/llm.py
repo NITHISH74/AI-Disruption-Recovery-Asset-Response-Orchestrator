@@ -1,4 +1,4 @@
-"""Budgeted, cached, best-effort text generation. Never used for core decisions.
+"""Budgeted, cached, best-effort generation; validated agent proposals are advisory.
 
 All paid requests require an atomic usage reservation. If accounting is unavailable,
 we fail closed to the caller's template instead of making an unmetered request.
@@ -13,14 +13,14 @@ _failures = 0
 _lock = threading.RLock()  # Single-flight cache and circuit breaker within this process.
 _logger = logging.getLogger(__name__)
 _ROOT = Path(__file__).resolve().parent.parent
-_MAX_OUTPUT = 180
+_MAX_OUTPUT = 1024
 
 
 def _now(): return datetime.now(timezone.utc)
 
 def _limits():
-    try: calls = max(0, min(15, int(os.getenv('LLM_MAX_CALLS', '15'))))
-    except ValueError: calls = 15
+    try: calls = max(0, min(12, int(os.getenv('LLM_MAX_CALLS', '12'))))
+    except ValueError: calls = 12
     try: tokens = max(0, min(25000, int(os.getenv('LLM_MAX_TOKENS', '25000'))))
     except ValueError: tokens = 25000
     return calls, tokens
@@ -126,7 +126,7 @@ def _provider_request(model, system, text):
     return value,prompt,completion
 
 
-def get_llm(system, text, fallback, *, incident_id=None, agent='unknown', priority=False):
+def get_llm(system, text, fallback, *, incident_id=None, agent='unknown', priority=False, validator=None, free_only=False):
     """Return generated text or fallback. All accounting failures fail closed.
 
     Calls are reserved per attempt; cache hits and templates do not consume the live
@@ -137,6 +137,7 @@ def get_llm(system, text, fallback, *, incident_id=None, agent='unknown', priori
     primary=(os.getenv('LLM_MODEL_PRIORITY') if priority else None) or os.getenv('LLM_MODEL','gemini-2.0-flash')
     secondary=os.getenv('LLM_FALLBACK','llama-3.3-70b-versatile')
     models=list(dict.fromkeys(m for m in (primary,secondary) if m))
+    if free_only: models=[m for m in models if m in MODELS and all(rate == 0 for rate in MODELS[m][1:])]
     try:
         with _lock:
             db=_accounting()
@@ -146,7 +147,7 @@ def get_llm(system, text, fallback, *, incident_id=None, agent='unknown', priori
             for model in (models[:1] if primary_paid else models):
                 if model not in MODELS: continue
                 cached=db.cache_get(cache_key(model,system,text))
-                if cached is not None:
+                if cached is not None and (validator is None or validator(cached)):
                     db.record(incident,agent,model,'cache',True)
                     return cached
             if _failures >= 3:
@@ -160,7 +161,7 @@ def get_llm(system, text, fallback, *, incident_id=None, agent='unknown', priori
                     continue
                 if model != primary and primary_paid:
                     cached=db.cache_get(cache_key(model,system,text))
-                    if cached is not None:
+                    if cached is not None and (validator is None or validator(cached)):
                         db.record(incident,agent,model,'cache',True)
                         return cached
                 if not _provider_key(MODELS[model][0]): continue
@@ -184,6 +185,10 @@ def get_llm(system, text, fallback, *, incident_id=None, agent='unknown', priori
                         db.finish(row_id,'unknown')
                     else:
                         db.finish(row_id,'live',prompt,completion,cost_usd(model,prompt,completion))
+                    # Never cache invalid structured agent responses.
+                    if validator is not None and not validator(value):
+                        db.record(incident,agent,model,'invalid')
+                        return fallback
                     db.cache_put(cache_key(model,system,text),model,value)
                     return value
             db.record(incident,agent,primary,'template')

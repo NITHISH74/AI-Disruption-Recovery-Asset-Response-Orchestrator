@@ -6,3 +6,5 @@
 .watch-banner{margin:12px 0;padding:14px 18px;border:1px solid #b78437;border-radius:10px;color:#f2c77b;background:#2a2115;font-size:13px;line-height:1.5}
 
 @media print { body *{visibility:hidden!important} #audit,#audit *{visibility:visible!important} #audit{display:block!important;position:absolute;inset:0;background:white;color:black} #audit .panel{background:white;color:black;border:0} #audit details{display:block} #print-report{display:none!important} }
+
+.schedule-pagination{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:14px 20px;color:#91a1b4;font-size:11px}.schedule-pagination button:disabled{opacity:.45;cursor:not-allowed}
